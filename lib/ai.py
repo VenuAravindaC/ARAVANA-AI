@@ -62,7 +62,7 @@ def generate_reply(
     try:
         import google.generativeai as genai
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash-latest",
+            model_name="gemini-3.8-flash",
             system_instruction=active_prompt
         )
 
@@ -133,7 +133,7 @@ Rules:
     try:
         import google.generativeai as genai
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash-latest",
+            model_name="gemini-3.8-flash",
             generation_config={"response_mime_type": "application/json"}
         )
         response = model.generate_content(full_prompt)

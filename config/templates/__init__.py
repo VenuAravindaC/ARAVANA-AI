@@ -1,0 +1,1 @@
+# ARVANA industry templates package
