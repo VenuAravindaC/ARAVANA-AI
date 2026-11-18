@@ -1523,19 +1523,6 @@ Looking forward to scaling your business!`
             });
         }
 
-                if (data.status === 'success') {
-                    output.innerHTML = `
-                        <p><span class="user">Partner:</span> ${input}</p>
-                        <p><span class="ai">ARVANA AI:</span> ${data.ai_response || data.result?.reply || 'No response generated'}</p>
-                    `;
-                } else {
-                    output.innerHTML = `<p style="color: var(--danger);">// Error: ${JSON.stringify(data, null, 2)}</p>`;
-                }
-            } catch (err) {
-                output.innerHTML = `<p style="color: var(--danger);">// Failed to test AI: ${err.message}</p>`;
-            }
-        }
-
         // Toggle Badges
         document.getElementById('booking_toggle').addEventListener('change', (e) => {
             document.getElementById('booking_enabled').value = e.target.checked;

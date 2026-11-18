@@ -2963,8 +2963,6 @@
                 'NEW': 'badge-new', 'WON': 'badge-won', 'LOST': 'badge-lost'
             };
 
-            const clientName = document.getElementById('clientCompanyName').innerText;
-
             listEl.innerHTML = filtered.map(lead => {
                 const waUrl = `https://wa.me/${lead.phone}?text=${encodeURIComponent('Hi ' + lead.name + ', following up regarding your inquiry with ' + clientName + '.')}`;
 
@@ -3088,7 +3086,6 @@
                     statVal.style.color = '#6366F1';
                 }
             }
-        }
         }
 
         // ========================================================
