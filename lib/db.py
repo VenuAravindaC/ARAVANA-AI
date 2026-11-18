@@ -76,7 +76,8 @@ async def get_or_create_conversation(client_id: str, customer_phone: str) -> dic
             new_conv = {
                 "client_id": client_id,
                 "customer_phone": customer_phone,
-                "bot_active": True  # Feature 3: Bot is active by default
+                "bot_active": True,  # Feature 3: Bot is active by default
+                "milestone_memory": {}
             }
             insert_res = supabase_client.table("conversations").insert(new_conv).execute()
             return insert_res.data[0]
@@ -91,7 +92,8 @@ async def get_or_create_conversation(client_id: str, customer_phone: str) -> dic
             "client_id": client_id,
             "customer_phone": customer_phone,
             "started_at": datetime.now(timezone.utc).isoformat(),
-            "bot_active": True  # Feature 3: Bot is active by default
+            "bot_active": True,  # Feature 3: Bot is active by default
+            "milestone_memory": {}
         }
     return _mock_conversations[key]
 
@@ -142,6 +144,49 @@ async def get_conversation_history(conversation_id: str, limit: int = 10) -> lis
     ]
 
 
+async def get_conversation_milestones(conversation_id: str) -> dict:
+    """
+    Retrieves active milestone memory (lead profile) for conversation context.
+    Preserves facts (budget, requirements, location, timeline) across 30-50+ turns.
+    """
+    if supabase_client:
+        try:
+            res = supabase_client.table("conversations").select("milestone_memory").eq("id", conversation_id).execute()
+            if res.data and res.data[0].get("milestone_memory"):
+                return res.data[0]["milestone_memory"]
+        except Exception as e:
+            logger.error(f"Error fetching milestone memory from Supabase: {e}")
+
+    for conv in _mock_conversations.values():
+        if conv.get("id") == conversation_id:
+            return conv.get("milestone_memory") or {}
+    return {}
+
+
+async def update_conversation_milestones(conversation_id: str, milestone_data: dict) -> dict:
+    """
+    Persists updated milestone facts into the conversation.
+    Only updates non-empty, non-placeholder values.
+    """
+    existing = await get_conversation_milestones(conversation_id)
+    merged = {**existing}
+    for k, v in milestone_data.items():
+        if v and str(v).strip() and str(v) not in ["None", "null", "General Inquiry", "Pending live key", "Exploring"]:
+            merged[k] = v
+
+    if supabase_client:
+        try:
+            supabase_client.table("conversations").update({"milestone_memory": merged}).eq("id", conversation_id).execute()
+        except Exception as e:
+            logger.error(f"Error updating milestone memory in Supabase: {e}")
+
+    for conv in _mock_conversations.values():
+        if conv.get("id") == conversation_id:
+            conv["milestone_memory"] = merged
+            return merged
+    return merged
+
+
 async def upsert_lead(client_id: str, conversation_id: str, customer_phone: str, lead_data: dict) -> dict:
     """Creates or updates a qualified lead entry for the CRM dashboard."""
     key = f"{client_id}:{customer_phone}"
@@ -151,6 +196,18 @@ async def upsert_lead(client_id: str, conversation_id: str, customer_phone: str,
             lead_id = _mock_leads[key]["id"]
         else:
             lead_id = str(uuid.uuid4())
+
+    # Sync milestone memory for the conversation
+    milestone_extract = {
+        "name": lead_data.get("name") or lead_data.get("customer_name"),
+        "requirements": lead_data.get("specific_requirements") or lead_data.get("service") or lead_data.get("inquiry_type"),
+        "budget": lead_data.get("budget_range") or lead_data.get("budget"),
+        "location": lead_data.get("location") or lead_data.get("preferred_location"),
+        "timeline": lead_data.get("timeline"),
+        "pain_points": lead_data.get("pain_points"),
+        "classification": lead_data.get("classification")
+    }
+    await update_conversation_milestones(conversation_id, milestone_extract)
 
     record = {
         "id": lead_id,

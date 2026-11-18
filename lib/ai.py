@@ -8,6 +8,7 @@ Never hardcodes agency-specific persona or assumes identity.
 import os
 import json
 import logging
+from typing import Optional, Dict, List, Any
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -51,6 +52,19 @@ Automatic site visit booking is ACTIVE.
 - If customer suggests an unavailable time, politely redirect to the nearest available slot.
 """
 
+# "FEEL HEARD" SUMMARY CONFIRMATION DIRECTIVE
+FEEL_HEARD_CONFIRMATION_DIRECTIVE = """
+"FEEL HEARD" SUMMARY CONFIRMATION RULE:
+Once you have gathered the lead's core details (such as requirements/service, budget, preferred area, or timeline), reflect a concise bullet-point summary back to the prospect to confirm their situation and make them feel understood before moving to booking or scheduling:
+"Just to make sure I've noted down everything accurately:
+• Requirement: [Extracted Requirement/Property/Service]
+• Budget: [Extracted Budget]
+• Location: [Extracted Preferred Area]
+• Timeline: [Extracted Timeline]
+Does this capture what you're looking for?"
+This builds immense trust. Once confirmed, smoothly offer available booking slots or next steps.
+"""
+
 # Safe neutral fallback if a client record has no prompt configured yet
 SAFE_NEUTRAL_PROMPT = """
 You are a helpful and polite customer support assistant for this business.
@@ -60,11 +74,40 @@ You are a helpful and polite customer support assistant for this business.
 """
 
 
+def format_milestone_memory(milestones: Optional[dict] = None) -> str:
+    """Formats previously established milestones and lead profile into high-priority context."""
+    if not milestones:
+        return ""
+    lines = [
+        "ESTABLISHED CONVERSATION MILESTONES & ACTIVE LEAD PROFILE (DO NOT RE-ASK FOR THESE):"
+    ]
+    if milestones.get("name"):
+        lines.append(f"• Name: {milestones['name']}")
+    req = milestones.get("requirements") or milestones.get("specific_requirements") or milestones.get("service")
+    if req:
+        lines.append(f"• Requirement/Service: {req}")
+    if milestones.get("budget"):
+        lines.append(f"• Budget: {milestones['budget']}")
+    loc = milestones.get("location") or milestones.get("preferred_location")
+    if loc:
+        lines.append(f"• Location/Area: {loc}")
+    if milestones.get("timeline"):
+        lines.append(f"• Timeline: {milestones['timeline']}")
+    if milestones.get("pain_points"):
+        lines.append(f"• Key Pain Points / Preferences: {milestones['pain_points']}")
+    if milestones.get("classification"):
+        lines.append(f"• Qualification Status: {milestones['classification']}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
 def build_system_prompt(
     system_prompt: str = None,
     business_knowledge: dict = None,
     available_slots: str = None,
-    booking_enabled: bool = True
+    booking_enabled: bool = True,
+    milestone_memory: Optional[dict] = None
 ) -> str:
     """
     Constructs a hardened, multi-tenant system prompt.
@@ -72,16 +115,23 @@ def build_system_prompt(
     1. Base client persona (or safe neutral fallback)
     2. Universal Competitor Defense & Anti-Prompt-Leakage firewall
     3. Strict Zero-Hallucination grounding rules
-    4. Business knowledge JSONB
-    5. Booking directive (Active calendar scheduling vs. smooth human concierge deflection)
+    4. "Feel Heard" Summary Confirmation rule
+    5. Established conversation milestone memory (active lead profile)
+    6. Business knowledge JSONB
+    7. Booking directive (Active calendar scheduling vs. smooth human concierge deflection)
     """
     base = system_prompt.strip() if system_prompt and system_prompt.strip() else SAFE_NEUTRAL_PROMPT.strip()
 
     prompt_parts = [
         base,
         SECURITY_AND_COMPETITOR_SHIELD.strip(),
-        GROUNDING_AND_ZERO_HALLUCINATION_GUARDRAILS.strip()
+        GROUNDING_AND_ZERO_HALLUCINATION_GUARDRAILS.strip(),
+        FEEL_HEARD_CONFIRMATION_DIRECTIVE.strip()
     ]
+
+    milestone_text = format_milestone_memory(milestone_memory)
+    if milestone_text:
+        prompt_parts.append(milestone_text)
 
     if business_knowledge:
         knowledge_text = json.dumps(business_knowledge, indent=2)
@@ -113,18 +163,20 @@ def generate_reply(
     system_prompt: str = None,
     business_knowledge: dict = None,
     available_slots: str = None,
-    booking_enabled: bool = True
+    booking_enabled: bool = True,
+    milestone_memory: Optional[dict] = None
 ) -> str:
     """
     Generates a contextual response using the specific client's prompt from the database.
     If no prompt is configured for this client, uses a safe neutral response (NEVER impersonates ARVANA).
-    Protected by universal security firewall and zero-hallucination grounding.
+    Protected by universal security firewall, zero-hallucination grounding, and milestone memory.
     """
     active_prompt = build_system_prompt(
         system_prompt=system_prompt,
         business_knowledge=business_knowledge,
         available_slots=available_slots,
-        booking_enabled=booking_enabled
+        booking_enabled=booking_enabled,
+        milestone_memory=milestone_memory
     )
 
     if not client_configured:
@@ -180,7 +232,9 @@ Extract the following details as valid JSON:
   "inquiry_type": string or null,
   "specific_requirements": string or null,
   "budget": string or null,
+  "location": string or null,
   "timeline": string or null,
+  "pain_points": string or null,
   "classification": "HOT" | "WARM" | "COLD" | "NEW",
   "ai_summary": string (1-2 sentence executive summary of the lead's need)
 }
@@ -208,7 +262,9 @@ DEFAULT CLASSIFICATION RULES:
             "inquiry_type": "General Inquiry",
             "specific_requirements": "Testing simulator mode",
             "budget": "Pending live key",
+            "location": "Local",
             "timeline": "Exploring",
+            "pain_points": None,
             "classification": "NEW",
             "ai_summary": "Lead simulated in local test mode."
         }

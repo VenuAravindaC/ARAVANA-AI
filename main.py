@@ -5,6 +5,7 @@ Built with FastAPI, Meta WhatsApp Cloud API, Google Gemini 1.5 Flash, and Supaba
 
 import os
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Query, Response, HTTPException, status
@@ -15,6 +16,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from lib import whatsapp, ai, db, notifications, bookings, followups
+from lib.debouncer import debouncer
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -107,7 +109,27 @@ async def receive_webhook(request: Request):
                     message_text = msg.get("text", {}).get("body", "")
 
                     logger.info(f"Received WhatsApp from {customer_phone} to phone_id {phone_number_id}: {message_text}")
-                    await process_incoming_message(phone_number_id, customer_phone, message_text)
+
+                    # IMMEDIATE STOP RULE: Cancel any scheduled follow-up sequence when customer replies
+                    if customer_phone:
+                        followups.cancel_pending_followup_for_customer(customer_phone)
+
+                    # MESSAGE DEBOUNCING / BUFFERING (10s timer):
+                    # Buffer rapid-fire messages from the same user so the AI generates
+                    # a single cohesive reply to the entire thought.
+                    async def _debounced_handler(phone: str, combined_text: str, meta: dict):
+                        await process_incoming_message(
+                            phone_number_id=meta.get("phone_number_id"),
+                            customer_phone=phone,
+                            message_text=combined_text
+                        )
+
+                    await debouncer.add_message(
+                        key=customer_phone,
+                        message_text=message_text,
+                        handler=_debounced_handler,
+                        metadata={"phone_number_id": phone_number_id}
+                    )
 
     # Meta expects instant 200 OK to acknowledge receipt
     return JSONResponse({"status": "received"}, status_code=200)
@@ -178,9 +200,15 @@ async def process_incoming_message(
     conversation = await db.get_or_create_conversation(client_id, customer_phone)
     conv_id = conversation["id"]
 
+    # IMMEDIATE STOP RULE: Cancel any scheduled follow-up sequence when customer sends a message
+    if customer_phone:
+        followups.cancel_pending_followup_for_customer(customer_phone)
+
     # FEATURE 3: Check if bot is paused (human handoff mode)
     if not conversation.get("bot_active", True):
         logger.info(f"Bot is PAUSED for conversation {conv_id}. Human is handling this chat.")
+        if customer_phone:
+            followups.cancel_pending_followup_for_customer(customer_phone)
         # Save the message but don't respond
         await db.save_message(conv_id, "customer", message_text)
         return {"status": "bot_paused", "conversation_id": conv_id, "message": "Human is handling this conversation"}
@@ -188,8 +216,9 @@ async def process_incoming_message(
     # 4. Save incoming customer message
     await db.save_message(conv_id, "customer", message_text)
 
-    # 5. Load recent conversation memory
+    # 5. Load recent conversation memory & milestone profile (preserves lead facts across 30-50+ turns)
     history = await db.get_conversation_history(conv_id, limit=10)
+    milestone_memory = await db.get_conversation_milestones(conv_id)
 
     # FEATURE 2: Check booking agent toggle & booking request
     booking_agent_active = is_booking_enabled_for_client(client)
@@ -206,13 +235,14 @@ async def process_incoming_message(
     elif not booking_agent_active and any(keyword in message_lower for keyword in booking_keywords):
         logger.info(f"Booking keywords detected, but Booking Agent is TURNED OFF for {client.get('business_name')}.")
 
-    # 6. Generate AI response using client's prompt & knowledge (FEATURE 4: With guardrails)
+    # 6. Generate AI response using client's prompt & knowledge (FEATURE 4: With guardrails & milestone memory)
     ai_reply = ai.generate_reply(
         messages=history,
         system_prompt=client.get("system_prompt"),
         business_knowledge=client.get("business_knowledge"),
         available_slots=available_slots_text,
-        booking_enabled=booking_agent_active
+        booking_enabled=booking_agent_active,
+        milestone_memory=milestone_memory
     )
 
     # 7. Send WhatsApp reply back to customer (Skip if in local simulation mode)
@@ -254,6 +284,10 @@ async def process_incoming_message(
     booking_extraction_result = {"booked": False}
     if is_booking_request:
         booking_extraction_result = await extract_booking_details(updated_history, client_id, customer_phone, lead_data.get("name", "Customer"))
+
+        # IMMEDIATE STOP RULE: Stop follow-ups immediately when an appointment is booked
+        if booking_extraction_result.get("booked") and customer_phone:
+            followups.cancel_pending_followup_for_customer(customer_phone)
 
         if not is_simulation and booking_extraction_result.get("booked") and broker_phone:
             booking_data = booking_extraction_result.get("booking", {})
@@ -340,6 +374,8 @@ class TestMessageRequest(BaseModel):
     phone_number_id: Optional[str] = "default_arvana_id"
     message: Optional[str] = None
     message_text: Optional[str] = None
+    debounce: Optional[bool] = False
+    debounce_delay: Optional[float] = None
 
 
 @app.post("/test-message", summary="Simulate WhatsApp Message (Local Testing)")
@@ -347,9 +383,38 @@ async def test_message(req: TestMessageRequest):
     """
     Test endpoint to simulate an incoming WhatsApp message without needing Meta credentials.
     Runs the full AI qualification, memory, and lead scoring pipeline.
+    Supports debouncing simulation if req.debounce is True.
     """
     phone = req.customer_phone or req.sender_phone or "919876543210"
     msg_text = req.message_text or req.message or "Hi! I am looking for lead automation for my real estate agency. Budget is around 20k."
+
+    # Immediate stop rule: user reply cancels pending follow-ups
+    followups.cancel_pending_followup_for_customer(phone)
+
+    if req.debounce:
+        async def _test_debounced_handler(p: str, combined: str, meta: dict):
+            return await process_incoming_message(
+                phone_number_id=meta.get("phone_number_id"),
+                customer_phone=p,
+                message_text=combined,
+                client_id=meta.get("client_id"),
+                is_simulation=True
+            )
+
+        await debouncer.add_message(
+            key=phone,
+            message_text=msg_text,
+            handler=_test_debounced_handler,
+            metadata={"phone_number_id": req.phone_number_id, "client_id": req.client_id},
+            delay=req.debounce_delay
+        )
+        return {
+            "status": "buffering",
+            "debounced": True,
+            "customer_phone": phone,
+            "buffered_messages": debouncer.get_buffered_messages(phone)
+        }
+
     result = await process_incoming_message(
         phone_number_id=req.phone_number_id,
         customer_phone=phone,
@@ -365,6 +430,13 @@ async def test_message(req: TestMessageRequest):
         "booking_data": result.get("booking_data"),
         "result": result
     }
+
+
+@app.post("/test-message/flush", summary="Manually Flush Debounced Messages for Customer")
+async def flush_debounced_test_messages(customer_phone: str = "919876543210"):
+    """Manually flushes the debounce buffer for testing without waiting for timer."""
+    res = await debouncer.flush(customer_phone)
+    return {"status": "flushed", "result": res}
 
 
 @app.get("/leads", summary="View All CRM Leads")
@@ -396,11 +468,12 @@ async def update_lead_status_endpoint(lead_id: str, req: LeadStatusUpdate):
 
 
 @app.get("/leads/followups-due", summary="Get Leads Due for Follow-Up")
-async def get_followups_due(client_id: Optional[str] = None):
+async def get_followups_due(client_id: Optional[str] = None, intra_24h: bool = False):
     """
-    Returns leads that require follow-up based on inactivity (>24h or marked COLD).
-    Enriches each lead with stage (24h Nudge, 48h Value Hook, Day 7 Soft Close),
-    hours inactive, and pre-calculated follow-up recommendation.
+    Returns leads that require follow-up based on inactivity:
+    - If intra_24h=True: evaluates 10m, 1h, 5h, 10h, 24h cadence within Meta's free service window.
+    - If intra_24h=False: evaluates standard cold lead cadence (>24h, >48h, >7d).
+    Enriches each lead with stage, hours inactive, and pre-calculated follow-up recommendation.
     """
     all_leads = await db.get_all_leads(client_id)
     clients_cache = {}
@@ -429,7 +502,7 @@ async def get_followups_due(client_id: Optional[str] = None):
             else:
                 continue
 
-        stage_info = followups.determine_followup_stage(last_dt, now)
+        stage_info = followups.determine_followup_stage(last_dt, now, intra_24h=intra_24h)
         if stage_info or lead.get("classification") == "COLD":
             if not stage_info:
                 stage_info = {
@@ -441,10 +514,10 @@ async def get_followups_due(client_id: Optional[str] = None):
 
             due_leads.append({
                 **lead,
-                "followup_stage": stage_info["stage"],
+                "followup_stage": stage_info.get("stage_number", stage_info["stage"]),
                 "followup_stage_name": stage_info["name"],
-                "hours_inactive": round(stage_info["hours_inactive"], 1),
-                "followup_goal": stage_info["goal"],
+                "hours_inactive": round(stage_info.get("hours_inactive", 0.0), 1),
+                "followup_goal": stage_info.get("goal", "Follow-up check-in"),
                 "followups_enabled_for_client": followups.is_followups_enabled_for_client(client) if client else True
             })
 
@@ -452,9 +525,10 @@ async def get_followups_due(client_id: Optional[str] = None):
 
 
 @app.post("/leads/{lead_id}/generate-followup", summary="Generate AI Follow-Up Message & 1-Click WhatsApp Link")
-async def generate_lead_followup(lead_id: str):
+async def generate_lead_followup(lead_id: str, intra_24h: bool = False):
     """
     Generates a personalized, stage-aware follow-up draft for a lead with a pre-filled 1-Click wa.me link.
+    Supports intra_24h context-aware mode (10m, 1h, 5h, 10h, 24h within Meta's free window).
     """
     lead = await db.get_lead_by_id(lead_id)
     if not lead:
@@ -472,9 +546,26 @@ async def generate_lead_followup(lead_id: str):
     result = followups.generate_followup_message(
         lead=lead,
         conversation_history=history,
-        business_knowledge=bk
+        business_knowledge=bk,
+        intra_24h=intra_24h
     )
     return {"status": "success", "followup": result}
+
+
+@app.post("/leads/{lead_id}/cancel-followup", summary="Cancel Pending Follow-up Sequence for Lead")
+async def cancel_lead_followup(lead_id: str):
+    """
+    IMMEDIATE STOP RULE:
+    Cancels any active or scheduled follow-up sequence for a lead (e.g. upon human takeover or broker request).
+    """
+    lead = await db.get_lead_by_id(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    phone = lead.get("customer_phone")
+    cancelled = False
+    if phone:
+        cancelled = followups.cancel_pending_followup_for_customer(phone)
+    return {"status": "cancelled", "lead_id": lead_id, "customer_phone": phone, "was_pending": cancelled}
 
 
 @app.post("/admin/cron/run-followups", summary="Cron Endpoint to Process Cold Lead Follow-Ups")
@@ -874,6 +965,10 @@ async def send_direct_whatsapp_message(req: DirectWhatsAppMessage):
         await db.pause_bot_for_conversation(conv_id)
         bot_status = "paused_for_human_takeover"
 
+    # IMMEDIATE STOP RULE: Cancel any scheduled follow-up sequence when human intervenes
+    if req.customer_phone:
+        followups.cancel_pending_followup_for_customer(req.customer_phone)
+
     return {
         "status": "success",
         "delivery": delivery,
@@ -889,7 +984,12 @@ async def pause_bot(conversation_id: str):
     """
     FEATURE 3: Pauses the bot for a specific conversation.
     When the broker replies from their phone or CRM, call this endpoint to make the bot go quiet.
+    IMMEDIATE STOP RULE: Also immediately halts any automated follow-up sequences.
     """
+    conv = await db.get_conversation_by_id(conversation_id)
+    if conv and conv.get("customer_phone"):
+        followups.cancel_pending_followup_for_customer(conv["customer_phone"])
+
     result = await db.pause_bot_for_conversation(conversation_id)
     return result
 
@@ -911,12 +1011,15 @@ async def toggle_bot(conversation_id: str):
     """
     Toggles the AI bot on or off for a conversation.
     Allows broker to toggle between AI handling and manual human response.
+    IMMEDIATE STOP RULE: When pausing the bot, immediately cancels pending follow-ups.
     """
     conv = await db.get_conversation_by_id(conversation_id)
     current_active = conv.get("bot_active", True) if conv else True
     if current_active:
         await db.pause_bot_for_conversation(conversation_id)
         new_active = False
+        if conv and conv.get("customer_phone"):
+            followups.cancel_pending_followup_for_customer(conv["customer_phone"])
     else:
         await db.resume_bot_for_conversation(conversation_id)
         new_active = True
