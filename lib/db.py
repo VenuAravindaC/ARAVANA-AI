@@ -9,7 +9,7 @@ import os
 import uuid
 import logging
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -90,7 +90,7 @@ async def get_or_create_conversation(client_id: str, customer_phone: str) -> dic
             "id": str(uuid.uuid4()),
             "client_id": client_id,
             "customer_phone": customer_phone,
-            "started_at": datetime.utcnow().isoformat(),
+            "started_at": datetime.now(timezone.utc).isoformat(),
             "bot_active": True  # Feature 3: Bot is active by default
         }
     return _mock_conversations[key]
@@ -103,7 +103,7 @@ async def save_message(conversation_id: str, sender: str, content: str) -> dict:
         "conversation_id": conversation_id,
         "sender": sender,  # 'customer' or 'ai'
         "content": content,
-        "timestamp": datetime.utcnow().isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     if supabase_client:
@@ -144,7 +144,16 @@ async def get_conversation_history(conversation_id: str, limit: int = 10) -> lis
 
 async def upsert_lead(client_id: str, conversation_id: str, customer_phone: str, lead_data: dict) -> dict:
     """Creates or updates a qualified lead entry for the CRM dashboard."""
+    key = f"{client_id}:{customer_phone}"
+    lead_id = lead_data.get("id")
+    if not lead_id:
+        if key in _mock_leads and "id" in _mock_leads[key]:
+            lead_id = _mock_leads[key]["id"]
+        else:
+            lead_id = str(uuid.uuid4())
+
     record = {
+        "id": lead_id,
         "client_id": client_id,
         "conversation_id": conversation_id,
         "customer_phone": customer_phone,
@@ -156,7 +165,7 @@ async def upsert_lead(client_id: str, conversation_id: str, customer_phone: str,
         "classification": lead_data.get("classification", "NEW"),
         "ai_summary": lead_data.get("ai_summary"),
         "custom_data": lead_data,
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.now(timezone.utc).isoformat()
     }
 
     if supabase_client:
@@ -167,7 +176,6 @@ async def upsert_lead(client_id: str, conversation_id: str, customer_phone: str,
         except Exception as e:
             logger.error(f"Error upserting lead into Supabase: {e}")
 
-    key = f"{client_id}:{customer_phone}"
     _mock_leads[key] = record
     return record
 
@@ -263,8 +271,8 @@ async def create_client(client_data: Dict[str, Any]) -> Dict[str, Any]:
     """Creates a new client record in Supabase."""
     if "id" not in client_data or not client_data["id"]:
         client_data["id"] = str(uuid.uuid4())
-    client_data["created_at"] = datetime.utcnow().isoformat()
-    client_data["updated_at"] = datetime.utcnow().isoformat()
+    client_data["created_at"] = datetime.now(timezone.utc).isoformat()
+    client_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     if supabase_client:
         try:
@@ -281,7 +289,7 @@ async def create_client(client_data: Dict[str, Any]) -> Dict[str, Any]:
 
 async def update_client(client_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Updates client settings, prompts, classification rules, or status."""
-    update_data["updated_at"] = datetime.utcnow().isoformat()
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     if supabase_client:
         try:
@@ -297,6 +305,24 @@ async def update_client(client_id: str, update_data: Dict[str, Any]) -> Optional
             client.update(update_data)
             return client
     return None
+
+
+async def delete_client(client_id: str) -> bool:
+    """Deletes a client record from Supabase or mock database."""
+    if supabase_client:
+        try:
+            supabase_client.table("clients").delete().eq("id", client_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting client {client_id} in Supabase: {e}")
+            return False
+
+    keys_to_del = [k for k, c in _mock_clients.items() if c.get("id") == client_id or k == client_id]
+    if keys_to_del:
+        for k in keys_to_del:
+            del _mock_clients[k]
+        return True
+    return False
 
 
 async def get_conversations_by_client(client_id: str) -> List[Dict[str, Any]]:
@@ -333,7 +359,7 @@ async def get_messages_by_conversation(conversation_id: str) -> List[Dict[str, A
 
 async def update_lead_status(lead_id: str, classification: Optional[str] = None, status: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Updates a lead's qualification classification (HOT/WARM/COLD) and/or deal status (NEW/WON/LOST)."""
-    updates = {"updated_at": datetime.utcnow().isoformat()}
+    updates = {"updated_at": datetime.now(timezone.utc).isoformat()}
     if classification:
         updates["classification"] = classification
     if status:
@@ -352,5 +378,37 @@ async def update_lead_status(lead_id: str, classification: Optional[str] = None,
         if lead.get("id") == lead_id:
             lead.update(updates)
             return lead
+    return None
+
+
+async def get_lead_by_id(lead_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a single lead by its UUID."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("leads").select("*").eq("id", lead_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error fetching lead {lead_id} from Supabase: {e}")
+
+    for lead in _mock_leads.values():
+        if lead.get("id") == lead_id:
+            return lead
+    return None
+
+
+async def get_conversation_by_id(conversation_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a conversation by its UUID."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("conversations").select("*").eq("id", conversation_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error fetching conversation {conversation_id} from Supabase: {e}")
+
+    for conv in _mock_conversations.values():
+        if conv.get("id") == conversation_id:
+            return conv
     return None
 

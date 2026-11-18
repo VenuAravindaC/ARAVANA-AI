@@ -5,7 +5,7 @@ Handles site visit scheduling with live availability checking.
 
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 import uuid
 from dotenv import load_dotenv
@@ -151,7 +151,42 @@ def _generate_default_slots(date: str) -> List[Dict]:
 def _is_slot_booked(client_id: str, date: str, time: str) -> bool:
     """Check if a specific slot is already booked (in-memory fallback only)."""
     key = f"{client_id}:{date}:{time}"
-    return key in _mock_bookings
+    return key in _mock_bookings and _mock_bookings[key].get("status") == "CONFIRMED"
+
+
+async def get_active_customer_booking(client_id: str, customer_phone: str) -> Optional[Dict]:
+    """
+    Checks if a customer already has an active CONFIRMED upcoming booking slot.
+    Enforces the anti-spam limit of 1 active booking per customer phone number.
+    """
+    if supabase_client:
+        try:
+            today_str = datetime.now().date().strftime("%Y-%m-%d")
+            result = supabase_client.table("bookings")\
+                .select("*")\
+                .eq("client_id", client_id)\
+                .eq("customer_phone", customer_phone)\
+                .eq("status", "CONFIRMED")\
+                .gte("date", today_str)\
+                .order("date", desc=False)\
+                .limit(1)\
+                .execute()
+            if result.data:
+                return result.data[0]
+            return None
+        except Exception as e:
+            logger.warning(f"Error checking active customer booking in Supabase: {e}")
+
+    # In-memory fallback
+    for key, booking in _mock_bookings.items():
+        if (
+            booking.get("client_id") == client_id
+            and booking.get("customer_phone") == customer_phone
+            and booking.get("status") == "CONFIRMED"
+        ):
+            return booking
+
+    return None
 
 
 async def book_slot(
@@ -160,10 +195,15 @@ async def book_slot(
     customer_name: str,
     date: str,
     time: str,
-    property_info: str = None
+    property_info: str = None,
+    reschedule: bool = False
 ) -> Dict:
     """
-    Books a time slot for a site visit.
+    Books a time slot for a site visit with strict anti-spam protection:
+    - Customers are restricted to 1 active upcoming booking to prevent calendar hijacking.
+    - If a customer already has an active booking and reschedule=False, the booking is blocked
+      and a polite reschedule prompt is returned.
+    - If reschedule=True, the previous booking is automatically cancelled/freed and the new slot is booked.
 
     :param client_id: Broker's client ID
     :param customer_phone: Customer's phone number
@@ -171,17 +211,50 @@ async def book_slot(
     :param date: Date (YYYY-MM-DD)
     :param time: Time (HH:MM AM/PM)
     :param property_info: Optional property details
-    :return: Booking confirmation or error
+    :param reschedule: Whether to reschedule an existing active booking
+    :return: Booking result dict
     """
-    # Check if slot is still available
+    # 1. Check if the requested slot is already taken by someone else
     if _is_slot_booked(client_id, date, time):
-        return {
-            "status": "error",
-            "message": "This slot is no longer available",
-            "booked": False
-        }
+        existing_slot = _mock_bookings.get(f"{client_id}:{date}:{time}")
+        if existing_slot and existing_slot.get("customer_phone") != customer_phone:
+            return {
+                "status": "error",
+                "message": "This slot is no longer available. Please select another time.",
+                "booked": False
+            }
 
-    # Create booking
+    # 2. ANTI-SPAM & ABUSE PROTECTION: Check if customer already holds an active booking
+    active_booking = await get_active_customer_booking(client_id, customer_phone)
+    if active_booking:
+        # Same slot requested again?
+        if active_booking.get("date") == date and active_booking.get("time") == time:
+            return {
+                "status": "already_booked",
+                "message": f"You already have a visit confirmed for {date} at {time}.",
+                "booked": True,
+                "booking_id": active_booking.get("id"),
+                "booking": active_booking
+            }
+
+        # If not requesting a reschedule, refuse second slot to protect broker's calendar
+        if not reschedule:
+            return {
+                "status": "limit_reached",
+                "message": (
+                    f"You already have a visit scheduled for {active_booking.get('date')} at {active_booking.get('time')}. "
+                    f"Would you like to reschedule your appointment to {date} at {time} instead?"
+                ),
+                "booked": False,
+                "existing_booking": active_booking,
+                "can_reschedule": True
+            }
+
+        # If reschedule is requested, cancel and free the prior booking
+        logger.info(f"Rescheduling booking {active_booking.get('id')} for {customer_phone} to {date} {time}")
+        await cancel_booking(active_booking.get("id"))
+
+    # 3. Create the new booking
     booking = {
         "client_id": client_id,
         "customer_phone": customer_phone,
@@ -198,8 +271,9 @@ async def book_slot(
             if result.data:
                 booked = result.data[0]
                 logger.info(f"Booking created in Supabase: {customer_name} on {date} at {time}")
+                status_code = "rescheduled" if active_booking else "success"
                 return {
-                    "status": "success",
+                    "status": status_code,
                     "message": f"Booking confirmed for {date} at {time}",
                     "booked": True,
                     "booking_id": booked["id"],
@@ -216,14 +290,15 @@ async def book_slot(
     # In-memory fallback
     booking_id = str(uuid.uuid4())
     booking["id"] = booking_id
-    booking["created_at"] = datetime.utcnow().isoformat()
+    booking["created_at"] = datetime.now(timezone.utc).isoformat()
     key = f"{client_id}:{date}:{time}"
     _mock_bookings[key] = booking
 
     logger.info(f"Booking created (in-memory): {customer_name} on {date} at {time}")
 
+    status_code = "rescheduled" if active_booking else "success"
     return {
-        "status": "success",
+        "status": status_code,
         "message": f"Booking confirmed for {date} at {time}",
         "booked": True,
         "booking_id": booking_id,
@@ -338,7 +413,7 @@ async def update_availability(
 
     # In-memory fallback
     key = f"{client_id}:{date}:{time}"
-    availability_record["updated_at"] = datetime.utcnow().isoformat()
+    availability_record["updated_at"] = datetime.now(timezone.utc).isoformat()
     _mock_availability[key] = availability_record
 
     logger.info(f"Availability updated (in-memory): {date} {time} -> {status}")

@@ -6,13 +6,15 @@ Built with FastAPI, Meta WhatsApp Cloud API, Google Gemini 1.5 Flash, and Supaba
 import os
 import logging
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Query, Response, HTTPException, status
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from lib import whatsapp, ai, db, notifications, bookings
+from lib import whatsapp, ai, db, notifications, bookings, followups
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -177,7 +179,7 @@ async def process_incoming_message(
     conv_id = conversation["id"]
 
     # FEATURE 3: Check if bot is paused (human handoff mode)
-    if not is_simulation and not conversation.get("bot_active", True):
+    if not conversation.get("bot_active", True):
         logger.info(f"Bot is PAUSED for conversation {conv_id}. Human is handling this chat.")
         # Save the message but don't respond
         await db.save_message(conv_id, "customer", message_text)
@@ -209,7 +211,8 @@ async def process_incoming_message(
         messages=history,
         system_prompt=client.get("system_prompt"),
         business_knowledge=client.get("business_knowledge"),
-        available_slots=available_slots_text
+        available_slots=available_slots_text,
+        booking_enabled=booking_agent_active
     )
 
     # 7. Send WhatsApp reply back to customer (Skip if in local simulation mode)
@@ -295,23 +298,29 @@ Extract as JSON:
 {{
   "has_booking_details": true/false,
   "date": "YYYY-MM-DD" or null,
-  "time": "HH:MM AM/PM" or null
+  "time": "HH:MM AM/PM" or null,
+  "is_reschedule": true/false
 }}
 
 Only set has_booking_details to true if the customer provided BOTH a specific date AND time.
+Set is_reschedule to true if the customer is asking to change, shift, or reschedule an existing appointment.
 """
 
     try:
         booking_info = ai.extract_lead_data([{"role": "user", "content": extraction_prompt}])
 
         if booking_info.get("has_booking_details") and booking_info.get("date") and booking_info.get("time"):
-            # Attempt to book the slot
+            reschedule_intent = any(w in conversation_text.lower() for w in ["reschedule", "change", "shift", "another time", "different time", "cancel and"])
+            is_reschedule = bool(booking_info.get("is_reschedule")) or reschedule_intent
+
+            # Attempt to book or reschedule the slot
             result = await bookings.book_slot(
                 client_id=client_id,
                 customer_phone=customer_phone,
                 customer_name=customer_name,
                 date=booking_info["date"],
-                time=booking_info["time"]
+                time=booking_info["time"],
+                reschedule=is_reschedule
             )
             return result
     except Exception as e:
@@ -329,7 +338,8 @@ class TestMessageRequest(BaseModel):
     customer_phone: Optional[str] = None
     sender_phone: Optional[str] = None
     phone_number_id: Optional[str] = "default_arvana_id"
-    message: str = "Hi! I am looking for lead automation for my real estate agency. Budget is around 20k."
+    message: Optional[str] = None
+    message_text: Optional[str] = None
 
 
 @app.post("/test-message", summary="Simulate WhatsApp Message (Local Testing)")
@@ -339,10 +349,11 @@ async def test_message(req: TestMessageRequest):
     Runs the full AI qualification, memory, and lead scoring pipeline.
     """
     phone = req.customer_phone or req.sender_phone or "919876543210"
+    msg_text = req.message_text or req.message or "Hi! I am looking for lead automation for my real estate agency. Budget is around 20k."
     result = await process_incoming_message(
         phone_number_id=req.phone_number_id,
         customer_phone=phone,
-        message_text=req.message,
+        message_text=msg_text,
         client_id=req.client_id,
         is_simulation=True
     )
@@ -384,6 +395,121 @@ async def update_lead_status_endpoint(lead_id: str, req: LeadStatusUpdate):
     return {"status": "success", "lead": updated}
 
 
+@app.get("/leads/followups-due", summary="Get Leads Due for Follow-Up")
+async def get_followups_due(client_id: Optional[str] = None):
+    """
+    Returns leads that require follow-up based on inactivity (>24h or marked COLD).
+    Enriches each lead with stage (24h Nudge, 48h Value Hook, Day 7 Soft Close),
+    hours inactive, and pre-calculated follow-up recommendation.
+    """
+    all_leads = await db.get_all_leads(client_id)
+    clients_cache = {}
+    due_leads = []
+    now = datetime.now(timezone.utc)
+
+    for lead in all_leads:
+        cid = lead.get("client_id")
+        if cid and cid not in clients_cache:
+            clients_cache[cid] = await db.get_client_by_id(cid)
+        client = clients_cache.get(cid)
+
+        # Inactivity evaluation
+        raw_time = lead.get("last_message_at") or lead.get("last_interaction") or lead.get("updated_at")
+        last_dt = None
+        if raw_time:
+            try:
+                clean_iso = str(raw_time).replace("Z", "+00:00")
+                last_dt = datetime.fromisoformat(clean_iso)
+            except Exception:
+                pass
+
+        if not last_dt:
+            if lead.get("classification") == "COLD":
+                last_dt = now - timedelta(hours=25)
+            else:
+                continue
+
+        stage_info = followups.determine_followup_stage(last_dt, now)
+        if stage_info or lead.get("classification") == "COLD":
+            if not stage_info:
+                stage_info = {
+                    "stage": 1,
+                    "name": "24h Nudge",
+                    "hours_inactive": 24.0,
+                    "goal": "Friendly warm check-in asking if they had a chance to review property options"
+                }
+
+            due_leads.append({
+                **lead,
+                "followup_stage": stage_info["stage"],
+                "followup_stage_name": stage_info["name"],
+                "hours_inactive": round(stage_info["hours_inactive"], 1),
+                "followup_goal": stage_info["goal"],
+                "followups_enabled_for_client": followups.is_followups_enabled_for_client(client) if client else True
+            })
+
+    return {"due_count": len(due_leads), "leads": due_leads}
+
+
+@app.post("/leads/{lead_id}/generate-followup", summary="Generate AI Follow-Up Message & 1-Click WhatsApp Link")
+async def generate_lead_followup(lead_id: str):
+    """
+    Generates a personalized, stage-aware follow-up draft for a lead with a pre-filled 1-Click wa.me link.
+    """
+    lead = await db.get_lead_by_id(lead_id)
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    client = None
+    if lead.get("client_id"):
+        client = await db.get_client_by_id(lead["client_id"])
+
+    history = []
+    if lead.get("conversation_id"):
+        history = await db.get_conversation_history(lead["conversation_id"])
+
+    bk = client.get("business_knowledge") if client else {}
+    result = followups.generate_followup_message(
+        lead=lead,
+        conversation_history=history,
+        business_knowledge=bk
+    )
+    return {"status": "success", "followup": result}
+
+
+@app.post("/admin/cron/run-followups", summary="Cron Endpoint to Process Cold Lead Follow-Ups")
+async def cron_run_followups():
+    """
+    Batch evaluates cold/inactive leads across all active clients with follow_ups_enabled.
+    Generates follow-up drafts for the CRM queue.
+    """
+    clients = await db.get_all_clients()
+    processed_clients = 0
+    generated_drafts = []
+
+    for client in clients:
+        if not followups.is_followups_enabled_for_client(client):
+            continue
+
+        processed_clients += 1
+        client_id = client.get("id")
+        leads = await db.get_all_leads(client_id)
+        for lead in leads:
+            if lead.get("classification") == "COLD":
+                draft = followups.generate_followup_message(
+                    lead,
+                    business_knowledge=client.get("business_knowledge")
+                )
+                generated_drafts.append(draft)
+
+    return {
+        "status": "success",
+        "active_followup_clients": processed_clients,
+        "drafts_generated": len(generated_drafts),
+        "drafts": generated_drafts
+    }
+
+
 # =====================================================================
 # CONVERSATIONS & CHAT TRANSCRIPT ENDPOINTS
 # =====================================================================
@@ -410,6 +536,26 @@ async def get_conversation_messages(conversation_id: str):
 # AGENCY ADMIN CONTROL PANEL ENDPOINTS
 # =====================================================================
 
+class AgencyAuthRequest(BaseModel):
+    password: str
+
+
+@app.post("/admin/auth/verify", summary="Verify Agency Master Password")
+async def verify_agency_password(req: AgencyAuthRequest):
+    """
+    Protects the Standalone ARVANA Agency Admin panel from unauthorized access.
+    Checks against master agency password.
+    """
+    master_pass = os.getenv("AGENCY_ADMIN_PASSWORD", "arvana_admin_2026")
+    if req.password != master_pass:
+        raise HTTPException(status_code=401, detail="Invalid agency master password")
+    return {
+        "authenticated": True,
+        "token": "arvana_agency_master_session",
+        "message": "Welcome to ARVANA Agency Command Center"
+    }
+
+
 class ClientCreate(BaseModel):
     business_name: str
     phone_number_id: str
@@ -419,6 +565,9 @@ class ClientCreate(BaseModel):
     system_prompt: Optional[str] = None
     business_knowledge: Optional[Any] = None
     classification_rules: Optional[str] = None
+    booking_enabled: Optional[bool] = True
+    follow_ups_enabled: Optional[bool] = False
+    instagram_bridge_enabled: Optional[bool] = False
     status: Optional[str] = "ACTIVE"
 
 
@@ -430,6 +579,9 @@ class ClientUpdate(BaseModel):
     system_prompt: Optional[str] = None
     business_knowledge: Optional[Any] = None
     classification_rules: Optional[str] = None
+    booking_enabled: Optional[bool] = None
+    follow_ups_enabled: Optional[bool] = None
+    instagram_bridge_enabled: Optional[bool] = None
     status: Optional[str] = None
 
 
@@ -465,6 +617,17 @@ async def admin_get_client(client_id: str):
 @app.post("/admin/clients", summary="Onboard New Client (Agency Admin)")
 async def admin_create_client(req: ClientCreate):
     data = req.model_dump(exclude_none=True)
+    bk = data.get("business_knowledge") or {}
+    if not isinstance(bk, dict):
+        bk = {}
+    if "booking_enabled" in data:
+        bk["booking_enabled"] = data["booking_enabled"]
+    if "follow_ups_enabled" in data:
+        bk["follow_ups_enabled"] = data["follow_ups_enabled"]
+    if "instagram_bridge_enabled" in data:
+        bk["instagram_bridge_enabled"] = data["instagram_bridge_enabled"]
+    data["business_knowledge"] = bk
+
     created = await db.create_client(data)
     return {"status": "success", "client": created}
 
@@ -474,10 +637,36 @@ async def admin_update_client(client_id: str, req: ClientUpdate):
     data = req.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(status_code=400, detail="No fields provided for update")
-    updated = await db.update_client(client_id, data)
-    if not updated:
+
+    # Mirror feature flags into business_knowledge if updated
+    client = await db.get_client_by_id(client_id)
+    if not client:
         raise HTTPException(status_code=404, detail="Client not found")
+
+    bk = data.get("business_knowledge") or client.get("business_knowledge") or {}
+    if not isinstance(bk, dict):
+        bk = {}
+    if "booking_enabled" in data:
+        bk["booking_enabled"] = data["booking_enabled"]
+    if "follow_ups_enabled" in data:
+        bk["follow_ups_enabled"] = data["follow_ups_enabled"]
+    if "instagram_bridge_enabled" in data:
+        bk["instagram_bridge_enabled"] = data["instagram_bridge_enabled"]
+    data["business_knowledge"] = bk
+
+    updated = await db.update_client(client_id, data)
     return {"status": "success", "client": updated}
+
+
+@app.delete("/admin/clients/{client_id}", summary="Delete Client (Agency Admin)")
+async def admin_delete_client(client_id: str):
+    """
+    Deletes a client profile and frees its allocated resources.
+    """
+    success = await db.delete_client(client_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Client not found or could not be deleted")
+    return {"status": "success", "client_id": client_id}
 
 
 @app.post("/admin/clients/{client_id}/toggle-status", summary="Toggle Client Service Kill-Switch")
@@ -535,6 +724,67 @@ async def toggle_client_booking(client_id: str):
     }
 
 
+@app.post("/admin/clients/{client_id}/toggle-followups", summary="Toggle Cold Lead Follow-Ups Add-on (Admin Upsell)")
+async def toggle_client_followups(client_id: str):
+    """
+    Toggles the Cold Lead Follow-Up Engine ON/OFF for a client.
+    ARVANA monetizes this as a high-margin lead reactivation retainer.
+    """
+    client = await db.get_client_by_id(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    current_enabled = followups.is_followups_enabled_for_client(client)
+    new_enabled = not current_enabled
+
+    bk = client.get("business_knowledge") or {}
+    if not isinstance(bk, dict):
+        bk = {}
+    bk["follow_ups_enabled"] = new_enabled
+
+    update_payload = {
+        "follow_ups_enabled": new_enabled,
+        "business_knowledge": bk
+    }
+
+    try:
+        updated = await db.update_client(client_id, update_payload)
+    except Exception:
+        updated = await db.update_client(client_id, {"business_knowledge": bk})
+
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "business_name": client.get("business_name"),
+        "follow_ups_enabled": new_enabled
+    }
+
+
+@app.post("/admin/clients/{client_id}/toggle-instagram-bridge", summary="Toggle Instagram-to-WhatsApp Bridge (Admin Upsell)")
+async def toggle_client_instagram_bridge(client_id: str):
+    """
+    Toggles the Instagram-to-WhatsApp Bridge configuration for a client.
+    """
+    client = await db.get_client_by_id(client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    bk = client.get("business_knowledge") or {}
+    if not isinstance(bk, dict):
+        bk = {}
+    current_enabled = bool(bk.get("instagram_bridge_enabled", False))
+    new_enabled = not current_enabled
+    bk["instagram_bridge_enabled"] = new_enabled
+
+    updated = await db.update_client(client_id, {"business_knowledge": bk})
+    return {
+        "status": "success",
+        "client_id": client_id,
+        "business_name": client.get("business_name"),
+        "instagram_bridge_enabled": new_enabled
+    }
+
+
 # =====================================================================
 # TESTING & SIMULATION ENDPOINTS
 # =====================================================================
@@ -574,20 +824,78 @@ ACTION REQUIRED: This lead is ready to convert. Call them NOW!"""
 
 
 # =====================================================================
-# FEATURE 3: HUMAN HANDOFF & BOT PAUSE CONTROL
+# FEATURE 3: LIVE TWO-WAY WHATSAPP CHAT & HUMAN HANDOFF
 # =====================================================================
 
+class DirectWhatsAppMessage(BaseModel):
+    client_id: str
+    customer_phone: str
+    message: str
+    conversation_id: Optional[str] = None
+    auto_pause_bot: Optional[bool] = True
+
+
+@app.post("/whatsapp/send", summary="Send Direct WhatsApp Message (In-CRM Live Chat)")
+async def send_direct_whatsapp_message(req: DirectWhatsAppMessage):
+    """
+    Enables brokers to reply directly to leads from within the CRM live chat drawer.
+    Dispatches outbound message via Meta WhatsApp Cloud API (or mock mode),
+    records the message in conversation history with sender='agent',
+    and automatically pauses the AI bot so human and bot don't collide.
+    """
+    client = await db.get_client_by_id(req.client_id)
+    phone_id = client.get("phone_number_id") if client else None
+    token = client.get("access_token") if client else None
+
+    # Resolve or create conversation
+    conv_id = req.conversation_id
+    if not conv_id:
+        conv = await db.get_or_create_conversation(req.client_id, req.customer_phone)
+        conv_id = conv.get("id")
+
+    # Send outbound WhatsApp
+    delivery = await whatsapp.send_whatsapp_text(
+        to_phone=req.customer_phone,
+        text=req.message,
+        phone_number_id=phone_id,
+        access_token=token
+    )
+
+    # Save to message history as human agent
+    saved_msg = await db.save_message(
+        conversation_id=conv_id,
+        sender="agent",
+        content=req.message
+    )
+
+    # Automatically pause the bot if requested for seamless human takeover
+    bot_status = "active"
+    if req.auto_pause_bot and conv_id:
+        await db.pause_bot_for_conversation(conv_id)
+        bot_status = "paused_for_human_takeover"
+
+    return {
+        "status": "success",
+        "delivery": delivery,
+        "message": saved_msg,
+        "conversation_id": conv_id,
+        "bot_status": bot_status
+    }
+
+
 @app.post("/conversation/{conversation_id}/pause", summary="Pause Bot (Human Takeover)")
+@app.post("/conversations/{conversation_id}/pause", summary="Pause Bot (Alias)")
 async def pause_bot(conversation_id: str):
     """
     FEATURE 3: Pauses the bot for a specific conversation.
-    When the broker replies from their phone, call this endpoint to make the bot go quiet.
+    When the broker replies from their phone or CRM, call this endpoint to make the bot go quiet.
     """
     result = await db.pause_bot_for_conversation(conversation_id)
     return result
 
 
 @app.post("/conversation/{conversation_id}/resume", summary="Resume Bot")
+@app.post("/conversations/{conversation_id}/resume", summary="Resume Bot (Alias)")
 async def resume_bot(conversation_id: str):
     """
     FEATURE 3: Resumes the bot for a specific conversation.
@@ -595,6 +903,29 @@ async def resume_bot(conversation_id: str):
     """
     result = await db.resume_bot_for_conversation(conversation_id)
     return result
+
+
+@app.post("/conversation/{conversation_id}/toggle-bot", summary="Toggle Bot Active/Paused")
+@app.post("/conversations/{conversation_id}/toggle-bot", summary="Toggle Bot Active/Paused (Alias)")
+async def toggle_bot(conversation_id: str):
+    """
+    Toggles the AI bot on or off for a conversation.
+    Allows broker to toggle between AI handling and manual human response.
+    """
+    conv = await db.get_conversation_by_id(conversation_id)
+    current_active = conv.get("bot_active", True) if conv else True
+    if current_active:
+        await db.pause_bot_for_conversation(conversation_id)
+        new_active = False
+    else:
+        await db.resume_bot_for_conversation(conversation_id)
+        new_active = True
+
+    return {
+        "status": "success",
+        "conversation_id": conversation_id,
+        "bot_active": new_active
+    }
 
 
 # =====================================================================
@@ -643,12 +974,13 @@ class BookingRequest(BaseModel):
     date: str  # YYYY-MM-DD
     time: str  # HH:MM AM/PM
     property_info: Optional[str] = None
+    reschedule: Optional[bool] = False
 
 
 @app.post("/calendar/book", summary="Manually Book a Slot")
 async def manual_book(req: BookingRequest):
     """
-    FEATURE 2: Allows broker to manually book a slot from CRM.
+    FEATURE 2: Allows broker to manually book a slot from CRM with anti-spam limits.
     """
     result = await bookings.book_slot(
         client_id=req.client_id,
@@ -656,7 +988,8 @@ async def manual_book(req: BookingRequest):
         customer_name=req.customer_name,
         date=req.date,
         time=req.time,
-        property_info=req.property_info
+        property_info=req.property_info,
+        reschedule=bool(req.reschedule)
     )
     return result
 
@@ -737,6 +1070,25 @@ async def add_slot_endpoint(req: AddSlotRequest):
         "client_id": req.client_id,
         "result": result
     }
+
+
+# =====================================================================
+# STATIC ASSETS & DASHBOARD MOUNTS
+# =====================================================================
+
+@app.get("/admin", include_in_schema=False)
+async def admin_redirect():
+    """Redirects /admin to the Standalone Agency Admin Dashboard."""
+    return RedirectResponse(url="/agency-admin/")
+
+
+_crm_dir = os.path.join(os.path.dirname(__file__), "crm-design-preview")
+if os.path.isdir(_crm_dir):
+    app.mount("/crm", StaticFiles(directory=_crm_dir, html=True), name="crm")
+
+_admin_dir = os.path.join(os.path.dirname(__file__), "agency-admin")
+if os.path.isdir(_admin_dir):
+    app.mount("/agency-admin", StaticFiles(directory=_admin_dir, html=True), name="agency-admin")
 
 
 if __name__ == "__main__":
