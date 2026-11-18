@@ -8,6 +8,7 @@ Includes an in-memory fallback for immediate zero-config local testing.
 import os
 import uuid
 import logging
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -74,7 +75,8 @@ async def get_or_create_conversation(client_id: str, customer_phone: str) -> dic
 
             new_conv = {
                 "client_id": client_id,
-                "customer_phone": customer_phone
+                "customer_phone": customer_phone,
+                "bot_active": True  # Feature 3: Bot is active by default
             }
             insert_res = supabase_client.table("conversations").insert(new_conv).execute()
             return insert_res.data[0]
@@ -88,7 +90,8 @@ async def get_or_create_conversation(client_id: str, customer_phone: str) -> dic
             "id": str(uuid.uuid4()),
             "client_id": client_id,
             "customer_phone": customer_phone,
-            "started_at": datetime.utcnow().isoformat()
+            "started_at": datetime.utcnow().isoformat(),
+            "bot_active": True  # Feature 3: Bot is active by default
         }
     return _mock_conversations[key]
 
@@ -182,3 +185,172 @@ async def get_all_leads(client_id: str = None) -> list:
             logger.error(f"Error fetching leads from Supabase: {e}")
 
     return list(_mock_leads.values())
+
+
+async def pause_bot_for_conversation(conversation_id: str) -> dict:
+    """Feature 3: Pauses the bot for a conversation (human handoff)."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("conversations")\
+                .update({"bot_active": False})\
+                .eq("id", conversation_id)\
+                .execute()
+            return {"status": "bot_paused", "conversation_id": conversation_id}
+        except Exception as e:
+            logger.error(f"Error pausing bot: {e}")
+
+    # In-memory fallback
+    for key, conv in _mock_conversations.items():
+        if conv["id"] == conversation_id:
+            conv["bot_active"] = False
+            return {"status": "bot_paused", "conversation_id": conversation_id}
+
+    return {"status": "conversation_not_found"}
+
+
+async def resume_bot_for_conversation(conversation_id: str) -> dict:
+    """Feature 3: Resumes the bot for a conversation."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("conversations")\
+                .update({"bot_active": True})\
+                .eq("id", conversation_id)\
+                .execute()
+            return {"status": "bot_resumed", "conversation_id": conversation_id}
+        except Exception as e:
+            logger.error(f"Error resuming bot: {e}")
+
+    # In-memory fallback
+    for key, conv in _mock_conversations.items():
+        if conv["id"] == conversation_id:
+            conv["bot_active"] = True
+            return {"status": "bot_resumed", "conversation_id": conversation_id}
+
+    return {"status": "conversation_not_found"}
+
+
+# =====================================================================
+# AGENCY ADMIN & EXTENDED CRM DATABASE OPERATIONS
+# =====================================================================
+
+async def get_all_clients() -> List[Dict[str, Any]]:
+    """Retrieves all registered clients for the Agency Admin panel."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("clients").select("*").order("created_at", desc=False).execute()
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Error fetching all clients: {e}")
+    return list(_mock_clients.values())
+
+
+async def get_client_by_id(client_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a client by its UUID."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("clients").select("*").eq("id", client_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error fetching client by id {client_id}: {e}")
+    for client in _mock_clients.values():
+        if client.get("id") == client_id:
+            return client
+    return None
+
+
+async def create_client(client_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Creates a new client record in Supabase."""
+    if "id" not in client_data or not client_data["id"]:
+        client_data["id"] = str(uuid.uuid4())
+    client_data["created_at"] = datetime.utcnow().isoformat()
+    client_data["updated_at"] = datetime.utcnow().isoformat()
+
+    if supabase_client:
+        try:
+            res = supabase_client.table("clients").insert(client_data).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error creating client in Supabase: {e}")
+            raise e
+
+    _mock_clients[client_data["id"]] = client_data
+    return client_data
+
+
+async def update_client(client_id: str, update_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Updates client settings, prompts, classification rules, or status."""
+    update_data["updated_at"] = datetime.utcnow().isoformat()
+
+    if supabase_client:
+        try:
+            res = supabase_client.table("clients").update(update_data).eq("id", client_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error updating client {client_id} in Supabase: {e}")
+            raise e
+
+    for client in _mock_clients.values():
+        if client.get("id") == client_id:
+            client.update(update_data)
+            return client
+    return None
+
+
+async def get_conversations_by_client(client_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all conversations for a client, ordered by latest activity."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("conversations")\
+                .select("*")\
+                .eq("client_id", client_id)\
+                .order("last_message_at", desc=True)\
+                .execute()
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Error fetching conversations for client {client_id}: {e}")
+    filtered = [c for c in _mock_conversations.values() if c.get("client_id") == client_id]
+    return sorted(filtered, key=lambda x: x.get("started_at", ""), reverse=True)
+
+
+async def get_messages_by_conversation(conversation_id: str) -> List[Dict[str, Any]]:
+    """Retrieves all message history for a conversation in chronological order."""
+    if supabase_client:
+        try:
+            res = supabase_client.table("messages")\
+                .select("*")\
+                .eq("conversation_id", conversation_id)\
+                .order("timestamp", desc=False)\
+                .execute()
+            return res.data or []
+        except Exception as e:
+            logger.error(f"Error fetching messages for conversation {conversation_id}: {e}")
+    filtered = [m for m in _mock_messages if m.get("conversation_id") == conversation_id]
+    return sorted(filtered, key=lambda x: x.get("timestamp", ""))
+
+
+async def update_lead_status(lead_id: str, classification: Optional[str] = None, status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Updates a lead's qualification classification (HOT/WARM/COLD) and/or deal status (NEW/WON/LOST)."""
+    updates = {"updated_at": datetime.utcnow().isoformat()}
+    if classification:
+        updates["classification"] = classification
+    if status:
+        updates["status"] = status
+
+    if supabase_client:
+        try:
+            res = supabase_client.table("leads").update(updates).eq("id", lead_id).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            logger.error(f"Error updating lead {lead_id} in Supabase: {e}")
+            raise e
+
+    for lead in _mock_leads.values():
+        if lead.get("id") == lead_id:
+            lead.update(updates)
+            return lead
+    return None
+

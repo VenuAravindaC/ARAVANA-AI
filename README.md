@@ -8,21 +8,37 @@ An automated WhatsApp lead management backend engineered for Indian businesses (
 
 ```
 E:\BUISNESS\ARVANA\
-├── main.py                     # FastAPI application & Meta Webhook handlers
+├── main.py                     # FastAPI application, Webhook handlers & Admin endpoints
 ├── requirements.txt            # Python dependencies (FastAPI, Uvicorn, Gemini SDK, Supabase)
-├── supabase_schema.sql         # Database schema for multi-tenant clients & leads
 ├── .env.example                # Template for environment secrets
 ├── .env                        # Local secrets (never committed to Git)
-├── .gitignore                  # Git ignore rules (.venv, .env, __pycache__)
+├── .gitignore                  # Git ignore rules (.venv, .env, __pycache__, node_modules)
 │
 ├── config/                     # Client & Industry Configuration Blueprints
 │   └── templates/
-│       └── industry_templates.py # Seed prompt blueprints for Agency, Real Estate & D2C
+│       └── industry_templates.py # Seed prompt blueprints for Agency, Real Estate & Clinics
 │
-├── lib/                        # Core backend engines (100% Tenant-Agnostic)
-│   ├── ai.py                   # Dynamic Gemini AI engine (takes prompt from Database)
-│   ├── db.py                   # Supabase database client (with local in-memory fallback)
-│   └── whatsapp.py             # Meta Graph API v19.0 client for outbound messaging
+├── crm-design-preview/         # High-Fidelity Client CRM & Agency Dashboard Frontend
+│   ├── index.html              # Interactive CRM SPA (Leads, Calendar, Simulator, Admin)
+│   ├── package.json            # Vite frontend configuration
+│   └── vite.config.js          # Dev server proxy configuration
+│
+├── database/                   # Supabase PostgreSQL SQL Schemas & Migrations
+│   ├── supabase_schema.sql     # Core tables (clients, conversations, messages, leads)
+│   ├── supabase_schema_updates.sql # Booking & broker availability tables
+│   └── insert_test_client.sql  # Initial real estate test client data
+│
+├── docs/                       # Technical & Domain Documentation
+│   ├── BOOKING_SYSTEM.md       # Real estate site visit booking architecture
+│   ├── CLASSIFICATION_RULES.md # AI Lead qualification logic (HOT / WARM / COLD)
+│   └── archive/                # Architecture design guides
+│
+└── lib/                        # Core tenant-agnostic backend engines
+    ├── ai.py                   # Google Gemini AI qualification & structured extraction
+    ├── bookings.py             # Availability scheduler & site visit booking engine
+    ├── db.py                   # Supabase database client (with in-memory fallback)
+    ├── notifications.py        # Real-time broker alert notifications
+    └── whatsapp.py             # Meta Graph API client for WhatsApp messaging
 ```
 
 ---

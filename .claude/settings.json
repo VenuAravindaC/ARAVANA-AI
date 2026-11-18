@@ -2,7 +2,31 @@
   "permissions": {
     "allow": [
       "Bash(git commit -m 'Complete ARVANA multi-tenant WhatsApp AI lead automation system *)",
-      "Bash(.venv/Scripts/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000)"
+      "Bash(.venv/Scripts/python.exe -m uvicorn main:app --reload --host 0.0.0.0 --port 8000)",
+      "Bash(pkill -f \"python.*main.py\")",
+      "Bash(.venv/Scripts/python test_alerts_demo.py)",
+      "Bash(tail -30 C:\\\\Users\\\\venua\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\61aa0c350a6770af\\\\b373dc25-1b55-410d-b0f2-d55316613a57\\\\tasks\\\\b1tit78cy.output | grep -A 20 \"{\")",
+      "Read(//c//**)",
+      "Bash(curl -s http://localhost:8000/)",
+      "Bash(.venv/Scripts/python test_system.py)",
+      "Bash(.venv/Scripts/python -m py_compile main.py lib/*.py)",
+      "Bash(.venv/Scripts/python test_full_flow.py)",
+      "Bash(claude skill *)",
+      "Bash(claude plugin *)",
+      "Bash(start E:\\\\BUISNESS\\\\ARVANA\\\\docs\\\\crm-design-mockup.html)",
+      "Bash(start docs/crm-design-mockup.html)",
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+      "Bash(npm run *)",
+      "Bash(.venv/Scripts/python -m uvicorn main:app --port 8000 --reload)",
+      "Bash(python main.py)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8000/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/)",
+      "Bash(curl -s -X POST http://localhost:8000/test-message -H \"Content-Type: application/json\" -d \"{\\\\\"client_id\\\\\":\\\\\"00000000-0000-0000-0000-000000000001\\\\\",\\\\\"sender_phone\\\\\":\\\\\"919876543210\\\\\",\\\\\"message\\\\\":\\\\\"Hi, I want to book a visit for 3BHK flat this Friday at 11am\\\\\"}\")",
+      "Bash(curl -s -X POST http://localhost:8000/test-message -H \"Content-Type: application/json\" -d \"{\\\\\"client_id\\\\\":\\\\\"00000000-0000-0000-0000-000000000001\\\\\",\\\\\"sender_phone\\\\\":\\\\\"919876543210\\\\\",\\\\\"message\\\\\":\\\\\"Hi, I am interested in a 3BHK flat in Whitefield. Budget is 90L.\\\\\"}\")",
+      "Bash(curl -s -X POST http://localhost:8000/clients/00000000-0000-0000-0000-000000000001/toggle-booking)",
+      "Bash(curl -s -X POST http://localhost:8000/calendar/availability/add-slot -H \"Content-Type: application/json\" -d \"{\\\\\"client_id\\\\\":\\\\\"00000000-0000-0000-0000-000000000001\\\\\",\\\\\"date\\\\\":\\\\\"20/11/26\\\\\",\\\\\"start_time\\\\\":\\\\\"01:00 PM\\\\\",\\\\\"end_time\\\\\":\\\\\"02:00 PM\\\\\"}\")",
+      "Bash(curl -s -I http://localhost:5173/)",
+      "Bash(curl -s -I http://localhost:8000/)"
     ]
   }
 }
