@@ -1099,8 +1099,8 @@ COLD: Budget < 60L or unresponsive"></textarea>
     <div id="toast" class="toast">Success!</div>
 
     <script>
-        // Backend API Base URL
-        const API_BASE = window.location.origin;
+        // Backend API Base URL (defaults to port 8000 when running on independent static dev servers)
+        const API_BASE = window.location.port === '8000' ? window.location.origin : 'http://localhost:8000';
 
         // Master password from localStorage (stored on successful login)
         const MASTER_PASSWORD_KEY = 'arvana_agency_password';

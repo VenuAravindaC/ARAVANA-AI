@@ -2536,8 +2536,8 @@
 
     <!-- SCRIPT FOR LIVE FILTERING AND INTERACTION -->
     <script>
-        // Backend API Base URL
-        const API_BASE = 'http://localhost:8000';
+        // Backend API Base URL (defaults to port 8000 when running on independent static dev servers)
+        const API_BASE = window.location.port === '8000' ? window.location.origin : 'http://localhost:8000';
 
         // UserRole: 'client' or 'agency_admin'
         let currentUserRole = 'client';
